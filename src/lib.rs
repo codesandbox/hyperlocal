@@ -29,6 +29,10 @@
 mod client;
 #[cfg(feature = "client")]
 pub use client::{UnixClientExt, UnixConnector};
+#[cfg(feature = "client")]
+mod vsock_client;
+#[cfg(feature = "client")]
+pub use vsock_client::{VsockUnixClientExt, VsockUnixConnector};
 
 #[cfg(feature = "server")]
 mod server;
