@@ -83,7 +83,7 @@ impl tokio::io::AsyncRead for VsockUnixStream {
 /// use hyper::{Client, Body};
 /// use hyperlocal::VsockUnixConnector;
 ///
-/// let connector = VsockUnixConnector;
+/// let connector = VsockUnixConnector { port: 10000 };
 /// let client: Client<VsockUnixConnector, Body> = Client::builder().build(connector);
 /// ```
 ///
@@ -92,7 +92,8 @@ impl tokio::io::AsyncRead for VsockUnixStream {
 /// interface, consider using the `[VsockUnixClientExt]` trait instead.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VsockUnixConnector {
-    port: u32,
+    /// The vsock port to connect to
+    pub port: u32,
 }
 
 impl Unpin for VsockUnixConnector {}
@@ -156,7 +157,7 @@ pub trait VsockUnixClientExt {
     /// use hyper::Client;
     /// use hyperlocal::VsockUnixClientExt;
     ///
-    /// let client = Client::unix();
+    /// let client = Client::vsock(10000);
     /// ```
     fn vsock(port: u32) -> Client<VsockUnixConnector, Body> {
         Client::builder().build(VsockUnixConnector { port })
