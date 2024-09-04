@@ -1,66 +1,11 @@
-use std::{io, path::Path};
-
-use hyper::server::{Builder, Server};
-
-use conn::SocketIncoming;
-
-pub(crate) mod conn {
-    use futures_util::ready;
-    use hyper::server::accept::Accept;
-    use pin_project::pin_project;
-    use std::{
-        io,
-        path::Path,
-        pin::Pin,
-        task::{Context, Poll},
-    };
-    use tokio::net::{UnixListener, UnixStream};
-
-    /// A stream of connections from binding to a socket.
-    #[pin_project]
-    #[derive(Debug)]
-    pub struct SocketIncoming {
-        listener: UnixListener,
-    }
-
-    impl SocketIncoming {
-        /// Creates a new `SocketIncoming` binding to provided socket path.
-        pub fn bind(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-            let listener = UnixListener::bind(path)?;
-
-            Ok(Self { listener })
-        }
-
-        /// Creates a new `SocketIncoming` from Tokio's `UnixListener`
-        ///
-        /// ```rust,ignore
-        /// let socket = SocketIncoming::from_listener(unix_listener);
-        /// let server = Server::builder(socket).serve(service);
-        /// ```
-        pub fn from_listener(listener: UnixListener) -> Self {
-            Self { listener }
-        }
-    }
-
-    impl Accept for SocketIncoming {
-        type Conn = UnixStream;
-        type Error = io::Error;
-
-        fn poll_accept(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
-            let conn = ready!(self.listener.poll_accept(cx))?.0;
-            Poll::Ready(Some(Ok(conn)))
-        }
-    }
-
-    impl From<UnixListener> for SocketIncoming {
-        fn from(listener: UnixListener) -> Self {
-            Self::from_listener(listener)
-        }
-    }
-}
+use hyper::{
+    body::{Body, Incoming},
+    service::service_fn,
+    Request, Response,
+};
+use hyper_util::rt::TokioIo;
+use std::future::Future;
+use tokio::net::UnixListener;
 
 /// Extension trait for provisioning a hyper HTTP server over a Unix domain
 /// socket.
@@ -68,28 +13,68 @@ pub(crate) mod conn {
 /// # Example
 ///
 /// ```rust
-/// use hyper::{Server, Body, Response, service::{make_service_fn, service_fn}};
-/// use hyperlocal::UnixServerExt;
+/// use hyper::Response;
+/// use hyperlocal::UnixListenerExt;
+/// use tokio::net::UnixListener;
 ///
-/// # async {
-/// let make_service = make_service_fn(|_| async {
-///     Ok::<_, hyper::Error>(service_fn(|_req| async {
-///         Ok::<_, hyper::Error>(Response::new(Body::from("It works!")))
-///     }))
-/// });
+/// let future = async move {
+///     let listener = UnixListener::bind("/tmp/hyperlocal.sock").expect("parsed unix path");
 ///
-/// Server::bind_unix("/tmp/hyperlocal.sock")?.serve(make_service).await?;
-/// # Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-/// # };
+///     listener
+///         .serve(|| {
+///             |_request| async {
+///                 Ok::<_, hyper::Error>(Response::new("Hello, world.".to_string()))
+///             }
+///         })
+///         .await
+///         .expect("failed to serve a connection")
+/// };
 /// ```
-pub trait UnixServerExt {
-    /// Convenience method for constructing a Server listening on a Unix socket.
-    fn bind_unix(path: impl AsRef<Path>) -> Result<Builder<SocketIncoming>, io::Error>;
+pub trait UnixListenerExt {
+    /// Indefinitely accept and respond to connections.
+    ///
+    /// Pass a function which will generate the function which responds to
+    /// all requests for an individual connection.
+    fn serve<MakeResponseFn, ResponseFn, ResponseFuture, B, E>(
+        self,
+        f: MakeResponseFn,
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+    where
+        MakeResponseFn: Fn() -> ResponseFn,
+        ResponseFn: Fn(Request<Incoming>) -> ResponseFuture,
+        ResponseFuture: Future<Output = Result<Response<B>, E>>,
+        B: Body + 'static,
+        <B as Body>::Error: std::error::Error + Send + Sync,
+        E: std::error::Error + Send + Sync + 'static;
 }
 
-impl UnixServerExt for Server<SocketIncoming, ()> {
-    fn bind_unix(path: impl AsRef<Path>) -> Result<Builder<SocketIncoming>, io::Error> {
-        let incoming = SocketIncoming::bind(path)?;
-        Ok(Server::builder(incoming))
+impl UnixListenerExt for UnixListener {
+    fn serve<MakeServiceFn, ResponseFn, ResponseFuture, B, E>(
+        self,
+        f: MakeServiceFn,
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+    where
+        MakeServiceFn: Fn() -> ResponseFn,
+        ResponseFn: Fn(Request<Incoming>) -> ResponseFuture,
+        ResponseFuture: Future<Output = Result<Response<B>, E>>,
+        B: Body + 'static,
+        <B as Body>::Error: std::error::Error + Send + Sync,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        async move {
+            loop {
+                let (stream, _) = self.accept().await?;
+                let io = TokioIo::new(stream);
+
+                let svc_fn = service_fn(f());
+
+                hyper::server::conn::http1::Builder::new()
+                    // On OSX, disabling keep alive prevents serve_connection from
+                    // blocking and later returning an Err derived from E_NOTCONN.
+                    .keep_alive(false)
+                    .serve_connection(io, svc_fn)
+                    .await?;
+            }
+        }
     }
 }

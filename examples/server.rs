@@ -1,12 +1,13 @@
-use hyper::{
-    service::{make_service_fn, service_fn},
-    Body, Response, Server,
-};
-use hyperlocal::UnixServerExt;
 use std::{error::Error, fs, path::Path};
 
-const PHRASE: &str = "It's a Unix system. I know this.";
+use hyper::Response;
+use tokio::net::UnixListener;
 
+use hyperlocal::UnixListenerExt;
+
+const PHRASE: &str = "It's a Unix system. I know this.\n";
+
+// Adapted from https://hyper.rs/guides/1/server/hello-world/
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let path = Path::new("/tmp/hyperlocal.sock");
@@ -15,13 +16,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         fs::remove_file(path)?;
     }
 
-    let make_service = make_service_fn(|_| async {
-        Ok::<_, hyper::Error>(service_fn(|_req| async {
-            Ok::<_, hyper::Error>(Response::new(Body::from(PHRASE)))
-        }))
-    });
+    let listener = UnixListener::bind(path)?;
 
-    Server::bind_unix(path)?.serve(make_service).await?;
+    println!("Listening for connections at {}.", path.display());
+
+    listener
+        .serve(|| {
+            println!("Accepted connection.");
+
+            |_request| async {
+                let body = PHRASE.to_string();
+                Ok::<_, hyper::Error>(Response::new(body))
+            }
+        })
+        .await?;
 
     Ok(())
 }

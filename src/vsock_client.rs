@@ -1,37 +1,45 @@
-use futures_util::future::BoxFuture;
 use hex::FromHex;
-use hyper::{
-    client::connect::{Connected, Connection},
-    service::Service,
-    Body, Client, Uri,
+use hyper::{body::Body, rt::ReadBufCursor, Uri};
+use hyper_util::{
+    client::legacy::{
+        connect::{Connected, Connection},
+        Client,
+    },
+    rt::{TokioExecutor, TokioIo},
 };
-use pin_project::pin_project;
+use pin_project_lite::pin_project;
 use std::{
+    future::Future,
     io,
+    io::Error,
     path::{Path, PathBuf},
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::io::{AsyncReadExt, Interest, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, Interest, ReadBuf};
+use tower_service::Service;
 
-#[pin_project]
-#[derive(Debug)]
-pub struct VsockUnixStream {
-    #[pin]
-    unix_stream: tokio::net::UnixStream,
-
-    port: u32,
+pin_project! {
+    #[derive(Debug)]
+    pub struct VsockUnixStream {
+        #[pin]
+        unix_stream: tokio::net::UnixStream,
+        port: u32,
+    }
 }
 
 impl VsockUnixStream {
-    async fn connect<P>(path: P, port: u32) -> std::io::Result<Self>
+    async fn connect<P>(
+        path: P,
+        port: u32,
+    ) -> std::io::Result<Self>
     where
         P: AsRef<Path>,
     {
         let mut unix_stream = tokio::net::UnixStream::connect(path).await?;
         unix_stream.ready(Interest::WRITABLE).await?;
 
-        let connect_command = format!("CONNECT {}\n", port).into_bytes();
+        let connect_command = format!("CONNECT {port}\n").into_bytes();
         unix_stream.try_write(&connect_command)?;
 
         unix_stream.ready(Interest::READABLE).await?;
@@ -49,7 +57,7 @@ impl VsockUnixStream {
     }
 }
 
-impl tokio::io::AsyncWrite for VsockUnixStream {
+impl AsyncWrite for VsockUnixStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -57,15 +65,59 @@ impl tokio::io::AsyncWrite for VsockUnixStream {
     ) -> Poll<Result<usize, io::Error>> {
         self.project().unix_stream.poll_write(cx, buf)
     }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         self.project().unix_stream.poll_flush(cx)
     }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        self.project().unix_stream.poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, Error>> {
+        self.project().unix_stream.poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.unix_stream.is_write_vectored()
+    }
+}
+
+impl hyper::rt::Write for VsockUnixStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        self.project().unix_stream.poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Error>> {
+        self.project().unix_stream.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Error>> {
         self.project().unix_stream.poll_shutdown(cx)
     }
 }
 
-impl tokio::io::AsyncRead for VsockUnixStream {
+impl AsyncRead for VsockUnixStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -75,43 +127,67 @@ impl tokio::io::AsyncRead for VsockUnixStream {
     }
 }
 
+impl hyper::rt::Read for VsockUnixStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: ReadBufCursor<'_>,
+    ) -> Poll<Result<(), Error>> {
+        let mut t = TokioIo::new(self.project().unix_stream);
+        Pin::new(&mut t).poll_read(cx, buf)
+    }
+}
+
 /// the `[VsockUnixConnector]` can be used to construct a `[hyper::Client]` which can
 /// speak to a unix domain socket.
 ///
 /// # Example
 /// ```
-/// use hyper::{Client, Body};
+/// use http_body_util::Full;
+/// use hyper::body::Bytes;
+/// use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 /// use hyperlocal::VsockUnixConnector;
 ///
-/// let connector = VsockUnixConnector { port: 10000 };
-/// let client: Client<VsockUnixConnector, Body> = Client::builder().build(connector);
+/// let connector = VsockUnixConnector;
+/// let client: Client<VsockUnixConnector, Full<Bytes>> =
+///     Client::builder(TokioExecutor::new()).build(connector);
 /// ```
 ///
 /// # Note
 /// If you don't need access to the low-level `[hyper::Client]` builder
-/// interface, consider using the `[VsockUnixClientExt]` trait instead.
+/// interface, consider using the `[UnixClientExt]` trait instead.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VsockUnixConnector {
     /// The vsock port to connect to
-    pub port: u32,
+    port: u32,
 }
 
 impl Unpin for VsockUnixConnector {}
 
 impl Service<Uri> for VsockUnixConnector {
     type Response = VsockUnixStream;
-    type Error = std::io::Error;
-    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
-    fn call(&mut self, req: Uri) -> Self::Future {
+    type Error = io::Error;
+    #[allow(clippy::type_complexity)]
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn call(
+        &mut self,
+        req: Uri,
+    ) -> Self::Future {
         let port = self.port;
         let fut = async move {
-            let path = parse_socket_path(req)?;
+            let path = parse_socket_path(&req)?;
             VsockUnixStream::connect(path, port).await
         };
 
         Box::pin(fut)
     }
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -122,7 +198,7 @@ impl Connection for VsockUnixStream {
     }
 }
 
-fn parse_socket_path(uri: Uri) -> Result<std::path::PathBuf, io::Error> {
+fn parse_socket_path(uri: &Uri) -> Result<PathBuf, io::Error> {
     if uri.scheme_str() != Some("unix") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -147,21 +223,27 @@ fn parse_socket_path(uri: Uri) -> Result<std::path::PathBuf, io::Error> {
     }
 }
 
-/// Extention trait for constructing a hyper HTTP client over a VsockUnix domain
+/// Extension trait for constructing a hyper HTTP client over a Unix domain
 /// socket.
-pub trait VsockUnixClientExt {
-    /// Construct a client which speaks HTTP over a VsockUnix domain socket
+pub trait VsockUnixClientExt<B: Body + Send> {
+    /// Construct a client which speaks HTTP over a Unix domain socket
     ///
     /// # Example
     /// ```
-    /// use hyper::Client;
-    /// use hyperlocal::VsockUnixClientExt;
+    /// use http_body_util::Full;
+    /// use hyper::body::Bytes;
+    /// use hyper_util::client::legacy::Client;
+    /// use hyperlocal::{VsockClientExt, VsockUnixConnector};
     ///
-    /// let client = Client::vsock(10000);
+    /// let client: Client<VsockUnixConnector, Full<Bytes>> = Client::unix();
     /// ```
-    fn vsock(port: u32) -> Client<VsockUnixConnector, Body> {
-        Client::builder().build(VsockUnixConnector { port })
+    #[must_use]
+    fn vsock(port: u32) -> Client<VsockUnixConnector, B>
+    where
+        B::Data: Send,
+    {
+        Client::builder(TokioExecutor::new()).build(VsockUnixConnector { port })
     }
 }
 
-impl VsockUnixClientExt for Client<VsockUnixConnector> {}
+impl<B: Body + Send> VsockUnixClientExt<B> for Client<VsockUnixConnector, B> {}
